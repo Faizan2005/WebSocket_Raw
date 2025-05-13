@@ -3,6 +3,13 @@ import crypto from "crypto";
 
 const PORT = 8000;
 const MAGIC_STRING = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const SEVEN_BITS_INTEGER_MARKER = 125;
+const SIXTEEN_BITS_INTEGER_MARKER = 126;
+const SIXTYFOUR_BITS_INTEGER_MARKER = 127;
+
+const FIRST_BIT = 128;
+const MASK_KEY_BYTES_INDICATOR = 4;
+const OPCODE_TEXT = 0x1;
 
 const server = createServer((req, res) => {
   res.writeHead(200);
@@ -18,22 +25,54 @@ server.on("upgrade", onSocketUpgrade);
 
 function onSocketUpgrade(req, socket, head) {
   const { "sec-websocket-key": webClientSocketKey } = req.headers;
-  console.log(`${webClientSocketKey} connected!`);
+  console.log(`${webClientSocketKey} websocket connected!`);
 
   const response_headers = createHandshakeResponse(webClientSocketKey);
   socket.write(response_headers);
+  
+  socket.on("readable", () => onSocketReadable(socket));
+}
 
-  // Fix: use 'data' instead of 'readable' to read incoming frames
-  socket.on("data", (buffer) => {
-    console.log("Received data:", buffer);
+function onSocketReadable(socket) {
+  socket.read(1);
 
-    const message = decodeMessage(buffer);
-    console.log("Decoded message from client:", message);
+  const [MARKER_AND_PAYLOAD_LENGTH] = socket.read(1);
+  const length_indicator = MARKER_AND_PAYLOAD_LENGTH - FIRST_BIT;
 
-    // Fix: write a properly framed WebSocket message
-    const framed = encodeMessage("Hi from server!");
-    socket.write(framed);
+  let messageLength = 0;
+  if (length_indicator <= SEVEN_BITS_INTEGER_MARKER) {
+    messageLength = length_indicator;
+  } else if (length_indicator === SIXTEEN_BITS_INTEGER_MARKER) {
+    messageLength = socket.read(2).readUint16BE(0);
+  } else if (length_indicator >= SIXTYFOUR_BITS_INTEGER_MARKER) {
+    messageLength = socket.read(8).readUint64BE(0);
+  }
+
+  const mask_key = socket.read(MASK_KEY_BYTES_INDICATOR);
+  const encoded = socket.read(messageLength);
+
+  console.log("decoding data...");
+  const decoded = decodeMessage(encoded, mask_key);
+  const stringDecoded = decoded.toString("utf8");
+  const data = JSON.parse(stringDecoded);
+
+  console.log("message recieved!", data);
+
+  const msg = JSON.stringify({
+    message: data,
+    at: new Date().toISOString(),
   });
+  sendMessage(msg, socket);
+}
+
+function decodeMessage(encoded, mask_key) {
+  const finalBuffer = Buffer.from(encoded);
+
+  for (let index = 0; index < encoded.length; index++) {
+    finalBuffer[index] = encoded[index] ^ mask_key[index % 4];
+  }
+
+  return finalBuffer;
 }
 
 function createHandshakeResponse(socket_key) {
@@ -56,26 +95,49 @@ function createSocketAccept(socket_key) {
   return shaum.digest("base64");
 }
 
-// Minimal WebSocket message encoder (text-only, <126 bytes)
-function encodeMessage(str) {
-  const payload = Buffer.from(str);
-  const frame = Buffer.alloc(2 + payload.length);
-  frame[0] = 0x81; // text frame + FIN
-  frame[1] = payload.length; // assuming length < 126
-  payload.copy(frame, 2);
-  return frame;
+function sendMessage(message, socket) {
+  const data = prepareMessage(message);
+  return socket.write(data);
 }
 
-// Minimal WebSocket frame decoder (text-only, masked, <126 bytes)
-function decodeMessage(buffer) {
-  const length = buffer[1] & 0x7f;
-  const mask = buffer.slice(2, 6);
-  const data = buffer.slice(6, 6 + length);
+function prepareMessage(message) {
+  const msgBuff = Buffer.from(message);
+  const msgLength = msgBuff.length;
 
-  const unmasked = Buffer.alloc(length);
-  for (let i = 0; i < length; i++) {
-    unmasked[i] = data[i] ^ mask[i % 4];
+  const firstByte = 0x80 | OPCODE_TEXT;
+
+  let dataframeHeaderBuffer;
+
+  if (msgLength <= SEVEN_BITS_INTEGER_MARKER) {
+    // One-byte payload length
+    dataframeHeaderBuffer = Buffer.from([firstByte, msgLength]);
+  } else if (msgLength <= 0xffff) {
+    // 2-byte extended payload
+    dataframeHeaderBuffer = Buffer.alloc(4);
+    dataframeHeaderBuffer[0] = firstByte;
+    dataframeHeaderBuffer[1] = SIXTEEN_BITS_INTEGER_MARKER;
+    dataframeHeaderBuffer.writeUInt16BE(msgLength, 2);
+  } else {
+    // 8-byte extended payload
+    dataframeHeaderBuffer = Buffer.alloc(10);
+    dataframeHeaderBuffer[0] = firstByte;
+    dataframeHeaderBuffer[1] = SIXTYFOUR_BITS_INTEGER_MARKER;
+    dataframeHeaderBuffer.writeBigUInt64BE(BigInt(msgLength), 2);
   }
 
-  return unmasked.toString();
+  const totalLength = dataframeHeaderBuffer.length + msgBuff.length;
+  const finalResp = Buffer.concat([dataframeHeaderBuffer, msgBuff], totalLength);
+
+  return finalResp;
 }
+
+function concat(totalBuff, totalLength) {
+  const finalResp = Buffer.allocUnsafe(totalLength);
+  let offset = 0;
+  for (const buffer of totalBuff) {
+    buffer.copy(finalResp, offset);
+    offset += buffer.length;
+  }
+  return finalResp;
+}
+
