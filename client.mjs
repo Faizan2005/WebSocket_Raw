@@ -16,8 +16,7 @@ socket.onopen = (event) => {
   });
 
   const msgInterval = setInterval(() => {
-    socket.send(data), 2000
-  })
+    socket.send(data)}, 2000)
 };
 
 socket.onmessage = (msg) => {
