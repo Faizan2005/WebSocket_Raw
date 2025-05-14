@@ -29,7 +29,7 @@ function onSocketUpgrade(req, socket, head) {
 
   const response_headers = createHandshakeResponse(webClientSocketKey);
   socket.write(response_headers);
-  
+
   socket.on("readable", () => onSocketReadable(socket));
 }
 
@@ -44,7 +44,7 @@ function onSocketReadable(socket) {
     messageLength = length_indicator;
   } else if (length_indicator === SIXTEEN_BITS_INTEGER_MARKER) {
     messageLength = socket.read(2).readUint16BE(0);
-  } else if (length_indicator >= SIXTYFOUR_BITS_INTEGER_MARKER) {
+  } else {
     messageLength = socket.read(8).readUint64BE(0);
   }
 
